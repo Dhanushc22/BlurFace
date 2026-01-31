@@ -29,14 +29,13 @@ class FaceDetector:
         self.use_mediapipe = USE_MEDIAPIPE
         
         if USE_MEDIAPIPE and mp:
-            # MediaPipe Face Detection - use BOTH models for maximum coverage
+            # MediaPipe Face Detection - high accuracy mode
             try:
-                # Model 0: Short-range (within 2 meters) - better for close faces
-                # Model 1: Full-range (within 5 meters) - better for distant faces
-                # We'll use model 1 (full-range) with VERY low confidence
+                # Model 1: Full-range (within 5 meters) - better for all distances
+                # Using higher confidence to reduce false positives
                 self.detector = mp.face_detection.FaceDetection(
                     model_selection=1,  # Full-range model for ALL distances
-                    min_detection_confidence=0.4  # Balanced threshold - no false positives
+                    min_detection_confidence=0.55  # Balanced - catches side faces too
                 )
                 print("✅ Using MediaPipe Face Detection (full-range, balanced)", file=sys.stderr)
             except Exception as e:
@@ -68,17 +67,18 @@ class FaceDetector:
             sys.exit(1)
     
     def detect_faces_mediapipe(self, image):
-        """Detect faces using MediaPipe - FAST single pass"""
+        """Detect faces using MediaPipe - accurate single pass"""
         h, w = image.shape[:2]
         
-        # Single pass detection (fast)
+        # Single pass detection
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         results = self.detector.process(image_rgb)
         
         faces = []
         if results.detections:
             for detection in results.detections:
-                if detection.score[0] < 0.4:
+                # Balanced confidence for both front and side faces
+                if detection.score[0] < 0.55:
                     continue
                 
                 bbox = detection.location_data.relative_bounding_box
@@ -87,9 +87,18 @@ class FaceDetector:
                 width = int(bbox.width * w)
                 height = int(bbox.height * h)
                 
-                # Add margins for movement coverage
-                margin_x = int(width * 0.20)
-                margin_y = int(height * 0.20)
+                # Skip detections that are too small (likely false positives)
+                if width < 35 or height < 35:
+                    continue
+                
+                # Validate aspect ratio (faces are roughly square, not too wide/tall)
+                aspect_ratio = width / height if height > 0 else 0
+                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                    continue
+                
+                # Add small margins for smooth tracking (reduced from 20% to 10%)
+                margin_x = int(width * 0.10)
+                margin_y = int(height * 0.10)
                 
                 x = max(0, x - margin_x)
                 y = max(0, y - margin_y)
@@ -107,7 +116,7 @@ class FaceDetector:
         return faces
     
     def detect_faces_opencv(self, image):
-        """Detect ALL faces using OpenCV Haar Cascade (frontal + alt + profile, multi-scale)"""
+        """Detect faces using OpenCV Haar Cascade with strict settings to avoid false positives"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         # Enhance contrast for better detection
         gray = cv2.equalizeHist(gray)
@@ -115,18 +124,24 @@ class FaceDetector:
         
         all_faces = []
         
-        # Detect frontal faces with default detector
+        # Detect frontal faces with default detector - STRICT settings
         frontal_rects = self.frontal_detector.detectMultiScale(
             gray,
-            scaleFactor=1.05,    # Finer scale for better accuracy
-            minNeighbors=3,      # Lower for more detections
-            minSize=(20, 20),    # Smaller minimum for distant faces
+            scaleFactor=1.1,     # Standard scale for accuracy
+            minNeighbors=8,      # Very high = minimal false positives
+            minSize=(50, 50),    # Larger minimum face size
             flags=cv2.CASCADE_SCALE_IMAGE
         )
         
         for (x, y, fw, fh) in frontal_rects:
-            margin_x = int(fw * 0.25)
-            margin_y = int(fh * 0.25)
+            # Validate aspect ratio (reject non-face shapes)
+            aspect_ratio = fw / fh if fh > 0 else 0
+            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+                continue
+            
+            # Small margins (10%) for smooth tracking
+            margin_x = int(fw * 0.10)
+            margin_y = int(fh * 0.10)
             
             x = max(0, x - margin_x)
             y = max(0, y - margin_y)
@@ -141,19 +156,24 @@ class FaceDetector:
                 'probability': 0.9
             })
         
-        # Detect with alt detector (catches different face angles)
+        # Detect with alt detector (catches different face angles) - STRICT settings
         if hasattr(self, 'frontal_alt_detector') and not self.frontal_alt_detector.empty():
             alt_rects = self.frontal_alt_detector.detectMultiScale(
                 gray,
-                scaleFactor=1.05,
-                minNeighbors=3,
-                minSize=(20, 20),
+                scaleFactor=1.1,
+                minNeighbors=7,      # Very strict to avoid false positives
+                minSize=(50, 50),
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
             
             for (x, y, fw, fh) in alt_rects:
-                margin_x = int(fw * 0.25)
-                margin_y = int(fh * 0.25)
+                # Validate aspect ratio
+                aspect_ratio = fw / fh if fh > 0 else 0
+                if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+                    continue
+                
+                margin_x = int(fw * 0.10)
+                margin_y = int(fh * 0.10)
                 
                 x = max(0, x - margin_x)
                 y = max(0, y - margin_y)
@@ -168,19 +188,39 @@ class FaceDetector:
                     'probability': 0.88
                 })
         
-        # Detect profile faces (left-facing)
+        # Detect profile faces (left-facing) - MULTI-SCALE for better accuracy
         if hasattr(self, 'profile_detector') and not self.profile_detector.empty():
-            profile_rects = self.profile_detector.detectMultiScale(
+            # First pass: detect larger/closer profiles
+            profile_rects_close = self.profile_detector.detectMultiScale(
                 gray,
-                scaleFactor=1.03,      # Finer scale for better side face detection
-                minNeighbors=1,        # Even lower for side angles (catches more profile faces)
-                minSize=(15, 15),      # Smaller minimum for profile faces at distance
+                scaleFactor=1.1,       # Finer scale for close faces
+                minNeighbors=4,        # Balanced for profiles
+                minSize=(60, 60),      # Larger faces
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
             
-            for (x, y, fw, fh) in profile_rects:
-                margin_x = int(fw * 0.40)  # Larger margin for profiles - covers more area
-                margin_y = int(fh * 0.35)  # Increased top/bottom margin
+            # Second pass: detect smaller/distant profiles
+            profile_rects_far = self.profile_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.05,      # Very fine scale for distant faces
+                minNeighbors=5,        # Stricter for small detections
+                minSize=(35, 35),      # Smaller faces
+                maxSize=(80, 80),      # Cap to avoid overlap with first pass
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Combine both passes
+            all_profile_rects = list(profile_rects_close) + list(profile_rects_far)
+            
+            for (x, y, fw, fh) in all_profile_rects:
+                # Validate aspect ratio for profile faces (slightly wider range for profiles)
+                aspect_ratio = fw / fh if fh > 0 else 0
+                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                    continue
+                
+                # Profile faces need slightly larger margins to cover the full side
+                margin_x = int(fw * 0.20)
+                margin_y = int(fh * 0.15)
                 
                 x = max(0, x - margin_x)
                 y = max(0, y - margin_y)
@@ -192,24 +232,45 @@ class FaceDetector:
                     'y': int(y),
                     'width': int(fw),
                     'height': int(fh),
-                    'probability': 0.90  # Higher confidence for profile faces
+                    'probability': 0.87  # Good confidence for profiles
                 })
             
             # Detect right-facing profiles by flipping image
             flipped = cv2.flip(gray, 1)
-            profile_rects_flip = self.profile_detector.detectMultiScale(
+            
+            # First pass: close right-facing profiles
+            profile_rects_flip_close = self.profile_detector.detectMultiScale(
                 flipped,
-                scaleFactor=1.03,      # Finer scale for better side face detection
-                minNeighbors=1,        # Even lower for side angles
-                minSize=(15, 15),      # Smaller minimum for profile faces
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(60, 60),
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
             
-            for (x, y, fw, fh) in profile_rects_flip:
+            # Second pass: distant right-facing profiles
+            profile_rects_flip_far = self.profile_detector.detectMultiScale(
+                flipped,
+                scaleFactor=1.05,
+                minNeighbors=5,
+                minSize=(35, 35),
+                maxSize=(80, 80),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Combine both passes for flipped
+            all_profile_flip = list(profile_rects_flip_close) + list(profile_rects_flip_far)
+            
+            for (x, y, fw, fh) in all_profile_flip:
                 # Mirror x coordinate back
                 x = w - x - fw
-                margin_x = int(fw * 0.40)  # Larger margin for profiles - covers more area
-                margin_y = int(fh * 0.35)  # Increased top/bottom margin
+                
+                # Validate aspect ratio
+                aspect_ratio = fw / fh if fh > 0 else 0
+                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                    continue
+                
+                margin_x = int(fw * 0.20)
+                margin_y = int(fh * 0.15)
                 
                 x = max(0, x - margin_x)
                 y = max(0, y - margin_y)
@@ -221,7 +282,7 @@ class FaceDetector:
                     'y': int(y),
                     'width': int(fw),
                     'height': int(fh),
-                    'probability': 0.90  # Higher confidence for profile faces
+                    'probability': 0.87
                 })
         
         # Remove duplicate/overlapping detections
@@ -252,7 +313,7 @@ class FaceDetector:
                     union = area1 + area2 - intersection
                     iou = intersection / union if union > 0 else 0
                     
-                    if iou > 0.4:  # 40% overlap = duplicate (allow some overlap for side faces)
+                    if iou > 0.3:  # 30% overlap = duplicate (stricter)
                         is_duplicate = True
                         break
             
@@ -288,8 +349,8 @@ def process_frames(frame_dir, confidence=0.5, stride=1):
     Returns:
         Dictionary mapping frame filenames to detected faces
     """
-    # Balanced confidence - catch real faces, no false positives
-    detector = FaceDetector(0.4)
+    # Balanced confidence for front + side faces
+    detector = FaceDetector(0.55)
     
     # Get all frame files (support both PNG and JPG)
     frame_files = sorted([f for f in os.listdir(frame_dir) if f.endswith(('.jpg', '.png'))])
@@ -338,18 +399,20 @@ def process_frames(frame_dir, confidence=0.5, stride=1):
 
 def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
     """
-    Apply temporal smoothing to stabilize face blur and prevent blinking.
-    Uses face tracking with persistence to maintain blur across detection gaps.
+    Apply temporal smoothing with VELOCITY-BASED TRACKING.
+    Tracks face movement direction to predict position during brief detection gaps.
+    Only blurs verified face positions - never extends to unverified areas.
     """
-    detection_indices = sorted(raw_detections.keys())
     face_data = {}
     
-    # Track faces across frames with persistence
-    # Each tracked face has: position, last_seen, persistence_frames
+    # Tracking parameters - conservative to avoid false positives
+    PERSISTENCE_FRAMES = 5   # Maintain blur for 5 frames without detection
+    MATCH_DISTANCE = 250     # Stricter matching - faces must be close to be same track
+    VELOCITY_DAMPING = 0.7   # How much to reduce velocity prediction each frame
+    
+    # Track faces with velocity for smooth following
+    # Each track: {x, y, width, height, vx, vy, last_seen, frames_since_seen, confidence_streak}
     tracked_faces = []
-    PERSISTENCE_FRAMES = 12  # Keep blurring for 12 frames after losing detection
-    MAX_GAP_FILL = 25  # Fill gaps up to 25 frames for smooth continuous blur
-    MATCH_DISTANCE = 600  # Faces within 600px are considered same face
     
     for idx in range(total_frames):
         frame_file = frame_files[idx]
@@ -363,8 +426,14 @@ def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
         # Update tracked faces with new detections
         used_detections = set()
         
-        for track_idx, track in enumerate(tracked_faces):
-            # Find best matching detection for this tracked face
+        for track in tracked_faces:
+            # Predict where face should be based on velocity
+            predicted_x = track['x'] + track.get('vx', 0)
+            predicted_y = track['y'] + track.get('vy', 0)
+            predicted_cx = predicted_x + track['width'] / 2
+            predicted_cy = predicted_y + track['height'] / 2
+            
+            # Find best matching detection near predicted position
             best_match = None
             best_dist = float('inf')
             best_det_idx = -1
@@ -372,12 +441,12 @@ def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
             for det_idx, det in enumerate(detected_faces):
                 if det_idx in used_detections:
                     continue
-                # Calculate center-to-center distance
-                track_cx = track['x'] + track['width'] / 2
-                track_cy = track['y'] + track['height'] / 2
+                    
                 det_cx = det['x'] + det['width'] / 2
                 det_cy = det['y'] + det['height'] / 2
-                dist = ((track_cx - det_cx) ** 2 + (track_cy - det_cy) ** 2) ** 0.5
+                
+                # Distance from PREDICTED position (better for tracking moving faces)
+                dist = ((predicted_cx - det_cx) ** 2 + (predicted_cy - det_cy) ** 2) ** 0.5
                 
                 if dist < best_dist and dist < MATCH_DISTANCE:
                     best_dist = dist
@@ -385,19 +454,43 @@ def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
                     best_det_idx = det_idx
             
             if best_match:
-                # Update tracked face with smooth interpolation (reduces jitter)
-                alpha = 0.6  # Smoothing factor - higher = more responsive, lower = smoother
-                track['x'] = int(track['x'] * (1 - alpha) + best_match['x'] * alpha)
-                track['y'] = int(track['y'] * (1 - alpha) + best_match['y'] * alpha)
-                track['width'] = int(track['width'] * (1 - alpha) + best_match['width'] * alpha)
-                track['height'] = int(track['height'] * (1 - alpha) + best_match['height'] * alpha)
+                # Calculate velocity (movement from last position)
+                old_cx = track['x'] + track['width'] / 2
+                old_cy = track['y'] + track['height'] / 2
+                new_cx = best_match['x'] + best_match['width'] / 2
+                new_cy = best_match['y'] + best_match['height'] / 2
+                
+                # Update velocity with smoothing
+                new_vx = new_cx - old_cx
+                new_vy = new_cy - old_cy
+                track['vx'] = track.get('vx', 0) * 0.3 + new_vx * 0.7  # Smooth velocity
+                track['vy'] = track.get('vy', 0) * 0.3 + new_vy * 0.7
+                
+                # Update position directly to detected position (accurate tracking)
+                track['x'] = best_match['x']
+                track['y'] = best_match['y']
+                track['width'] = best_match['width']
+                track['height'] = best_match['height']
                 track['last_seen'] = idx
                 track['frames_since_seen'] = 0
+                track['confidence_streak'] = track.get('confidence_streak', 0) + 1
                 track['probability'] = best_match.get('probability', 0.9)
                 used_detections.add(best_det_idx)
             else:
-                # No match - increment frames since last seen
+                # No match found - only use velocity prediction if we have a good track
                 track['frames_since_seen'] = idx - track['last_seen']
+                
+                # Only predict position if we had a stable track (seen for multiple frames)
+                if track.get('confidence_streak', 0) >= 3 and track['frames_since_seen'] <= 2:
+                    # Apply velocity prediction with damping
+                    track['x'] = int(track['x'] + track.get('vx', 0) * VELOCITY_DAMPING)
+                    track['y'] = int(track['y'] + track.get('vy', 0) * VELOCITY_DAMPING)
+                    track['vx'] = track.get('vx', 0) * VELOCITY_DAMPING
+                    track['vy'] = track.get('vy', 0) * VELOCITY_DAMPING
+                else:
+                    # Don't predict if track is not stable - this prevents jumping to wrong areas
+                    track['vx'] = 0
+                    track['vy'] = 0
         
         # Add new tracked faces for unmatched detections
         for det_idx, det in enumerate(detected_faces):
@@ -407,14 +500,20 @@ def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
                     'y': det['y'],
                     'width': det['width'],
                     'height': det['height'],
+                    'vx': 0,
+                    'vy': 0,
                     'last_seen': idx,
                     'frames_since_seen': 0,
+                    'confidence_streak': 1,
                     'probability': det.get('probability', 0.9)
                 })
         
-        # Collect faces to blur (active tracks within persistence window)
+        # Collect faces to blur - ONLY from verified tracks
         for track in tracked_faces:
-            if track['frames_since_seen'] <= PERSISTENCE_FRAMES:
+            # Only blur if:
+            # 1. Recently seen (within persistence window)
+            # 2. Had at least 2 consecutive detections (filters one-off false positives)
+            if track['frames_since_seen'] <= PERSISTENCE_FRAMES and track.get('confidence_streak', 0) >= 2:
                 current_faces.append({
                     'x': track['x'],
                     'y': track['y'],
@@ -423,14 +522,14 @@ def apply_temporal_smoothing(frame_files, raw_detections, total_frames):
                     'probability': track.get('probability', 0.9)
                 })
         
-        # Remove stale tracks (not seen for too long)
-        tracked_faces = [t for t in tracked_faces if t['frames_since_seen'] <= PERSISTENCE_FRAMES + 5]
+        # Remove stale tracks
+        tracked_faces = [t for t in tracked_faces if t['frames_since_seen'] <= PERSISTENCE_FRAMES + 2]
         
         if current_faces:
             face_data[frame_file] = current_faces
     
-    # Second pass: fill remaining gaps with interpolation for even smoother results
-    face_data = fill_gaps_with_interpolation(frame_files, face_data, MAX_GAP_FILL)
+    # Skip gap filling - rely only on velocity-based tracking for accuracy
+    # This prevents blur from jumping to wrong areas
     
     return face_data
 

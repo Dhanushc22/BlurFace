@@ -67,7 +67,7 @@ app.get('/', (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'Server is running',
     timestamp: new Date().toISOString(),
     version: '2.0.0'
